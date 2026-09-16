@@ -1,6 +1,6 @@
 # watch-me-work (`wmw`)
 
-A terminal tool for watching my AI coding agents work in real time. I often lose track of which session is waiting on a permission or an approval, and which ones have finished versus still running. Orca ADE covers this, but I wanted a lightweight CLI/TUI version since I'm in a terminal most of the time. I plan to support more terminals and coding agents in the future, time permitting.
+A terminal tool for watching my AI coding agents work in real time. I often lose track of which session is waiting on a permission or an approval, and which ones have finished versus still running. Orca ADE does something similar as a desktop app, but I wanted a lightweight CLI/TUI version since I'm in a terminal most of the time. I plan to support more terminals and coding agents in the future, time permitting.
 
 Feel free to try it!
 
