@@ -34,8 +34,10 @@ func main() {
 		err = runStatus()
 	case "wait":
 		err = runWait(os.Args[2:])
+	case "config":
+		err = runConfig(os.Args[2:])
 	default:
-		fmt.Fprintln(os.Stderr, "usage: wmw [ls | status | wait <project> [state...] | install]  (no args opens the TUI)")
+		fmt.Fprintln(os.Stderr, "usage: wmw [ls | status | wait <project> [state...] | config ... | install]  (no args opens the TUI)")
 		os.Exit(2)
 	}
 	if err != nil {
@@ -53,24 +55,12 @@ func runLs() error {
 		fmt.Println("no live sessions")
 		return nil
 	}
-	now := time.Now().Unix()
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "PROJECT\tTITLE\tSTATE\tAGE")
+	fmt.Fprintln(w, "PROJECT\tTITLE\tSTATE")
 	for _, s := range ss {
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", s.Project(), oneLine(s.Title, 50), s.State, age(now-s.Updated))
+		fmt.Fprintf(w, "%s\t%s\t%s\n", s.Project(), oneLine(s.Title, 50), s.State)
 	}
 	return w.Flush()
-}
-
-func age(sec int64) string {
-	switch {
-	case sec < 60:
-		return fmt.Sprintf("%ds", sec)
-	case sec < 3600:
-		return fmt.Sprintf("%dm", sec/60)
-	default:
-		return fmt.Sprintf("%dh", sec/3600)
-	}
 }
 
 // runStatus prints one line for a tmux status bar, nothing when idle.
@@ -118,6 +108,39 @@ func runWait(args []string) error {
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
+}
+
+// runConfig prints the settings or sets one:
+//
+//	wmw config idle both|banner|sound
+//	wmw config sound Glass               (any name from `wmw config sounds`, or a file path)
+//	wmw config test                      (fire both notifications as configured)
+func runConfig(args []string) error {
+	c := loadConfig()
+	if len(args) == 0 {
+		fmt.Printf("idle:  %s   (both, banner, or sound)\nsound: %s\n", c.Idle, c.Sound)
+		return nil
+	}
+	switch {
+	case args[0] == "sounds":
+		fmt.Println(strings.Join(systemSounds(), "\n"))
+		return nil
+	case args[0] == "test":
+		notify("wmw: idle test", "this is the idle notification", c.Sound, c.Idle)
+		time.Sleep(1500 * time.Millisecond) // let the first clip finish
+		notify("wmw: alert test", "this is the blocked/failed notification", c.Sound, "both")
+		return nil
+	case len(args) == 2 && args[0] == "idle" && slices.Contains(notifyStyles, args[1]):
+		c.Idle = args[1]
+	case len(args) == 2 && args[0] == "sound":
+		if _, err := os.Stat(soundPath(args[1])); err != nil {
+			return fmt.Errorf("no sound %q; see `wmw config sounds` or give a file path", args[1])
+		}
+		c.Sound = args[1]
+	default:
+		return errors.New("usage: wmw config [idle both|banner|sound | sound <name|path> | sounds | test]")
+	}
+	return saveConfig(c)
 }
 
 var hookEvents = []string{"SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "Notification", "Stop", "StopFailure", "SessionEnd"}

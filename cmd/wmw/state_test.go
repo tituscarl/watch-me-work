@@ -1,8 +1,12 @@
 package main
 
 import (
+	"encoding/json"
 	"os"
+	"path/filepath"
+	"strconv"
 	"testing"
+	"time"
 )
 
 func TestFold(t *testing.T) {
@@ -46,6 +50,19 @@ func TestFold(t *testing.T) {
 	mid := fold(evs[:4], now)
 	if mid[0].State != "working" || mid[0].Note != "" {
 		t.Errorf("after PostToolUse: %+v", mid[0])
+	}
+	// unread: set by Stop, cleared by opening it or typing into it
+	if !got[1].Unread {
+		t.Error("a should be unread after Stop")
+	}
+	seen := fold(append(evs, Event{TS: now, Ev: "Seen", SID: "a"}), now)
+	if seen[1].Unread || seen[1].Updated != now-10 {
+		t.Errorf("Seen should clear unread without touching Updated: %+v", seen[1])
+	}
+	for _, s := range fold(append(evs, Event{TS: now, Ev: "UserPromptSubmit", SID: "a", Text: "more"}), now) {
+		if s.SID == "a" && s.Unread {
+			t.Errorf("typing should clear unread: %+v", s)
+		}
 	}
 	if oneLine("fix  the\ntests", 60) != "fix the tests" {
 		t.Errorf("oneLine: %q", oneLine("fix  the\ntests", 60))
@@ -99,5 +116,102 @@ func TestLastTitle(t *testing.T) {
 `), 0o600)
 	if got := lastTitle(p); got != "okay" {
 		t.Errorf("first prompt fallback, got %q", got)
+	}
+}
+
+func TestTuiOpen(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	if tuiOpen() {
+		t.Error("no pid file should read as closed")
+	}
+	os.MkdirAll(filepath.Dir(tuiPidPath()), 0o700)
+	os.WriteFile(tuiPidPath(), []byte(strconv.Itoa(os.Getpid())), 0o600)
+	if !tuiOpen() {
+		t.Error("own pid should read as open")
+	}
+	os.WriteFile(tuiPidPath(), []byte("999999"), 0o600) // nothing runs there
+	if tuiOpen() {
+		t.Error("dead pid should read as closed")
+	}
+}
+
+func TestConfig(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	if loadConfig().Idle != "both" {
+		t.Error("default should be both")
+	}
+	if err := runConfig([]string{"idle", "loud"}); err == nil {
+		t.Error("bad style should be rejected")
+	}
+	if err := runConfig([]string{"idle", "sound"}); err != nil {
+		t.Fatal(err)
+	}
+	if loadConfig().Idle != "sound" {
+		t.Error("setting did not persist")
+	}
+	if err := runConfig([]string{"sound", "NoSuchSound"}); err == nil {
+		t.Error("unknown sound should be rejected")
+	}
+	if err := runConfig([]string{"sound", "Hero"}); err != nil {
+		t.Skip("no system sounds here:", err) // linux CI
+	}
+	if loadConfig().Sound != "Hero" {
+		t.Error("sound did not persist")
+	}
+	custom := t.TempDir() + "/ding.aiff"
+	os.WriteFile(custom, []byte("x"), 0o600)
+	if err := runConfig([]string{"sound", custom}); err != nil || loadConfig().Sound != custom {
+		t.Errorf("custom path: err=%v cfg=%+v", err, loadConfig())
+	}
+	// a config written by the short-lived two-sound version keeps its idle sound
+	os.WriteFile(configPath(), []byte(`{"idle":"both","idleSound":"Pop","alertSound":"Sosumi"}`), 0o600)
+	if loadConfig().Sound != "Pop" {
+		t.Errorf("legacy idleSound not picked up: %+v", loadConfig())
+	}
+}
+
+func TestRegistryCorrections(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_STATE_HOME", home)
+	os.MkdirAll(home+"/.claude/sessions", 0o700)
+	os.MkdirAll(home+"/wmw", 0o700)
+	now := time.Now().Unix()
+	write := func(name string, e Event) {
+		b, _ := json.Marshal(e)
+		f, _ := os.OpenFile(eventsPath(), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+		f.Write(append(b, '\n'))
+		f.Close()
+	}
+	write("", Event{TS: now - 60, Ev: "UserPromptSubmit", SID: "esc", CWD: "/r/esc", Text: "x"})
+	write("", Event{TS: now - 60, Ev: "UserPromptSubmit", SID: "busy", CWD: "/r/busy", Text: "y"})
+	write("", Event{TS: now - 60, Ev: "UserPromptSubmit", SID: "killed", CWD: "/r/killed", Text: "z"})
+	write("", Event{TS: now - 60, Ev: "UserPromptSubmit", SID: "unknown", CWD: "/r/unknown", Text: "w"})
+	me := os.Getpid()
+	reg := func(file, sid string, pid int, status string, at int64) {
+		b, _ := json.Marshal(map[string]any{"sessionId": sid, "pid": pid, "status": status, "statusUpdatedAt": at * 1000})
+		os.WriteFile(home+"/.claude/sessions/"+file, b, 0o600)
+	}
+	reg("1.json", "esc", me, "idle", now-30)     // interrupted after the prompt: should read idle
+	reg("2.json", "busy", me, "busy", now-30)    // still going
+	reg("3.json", "killed", 999999, "idle", now) // dead pid: should vanish
+	// "unknown" has no registry file: left alone
+
+	ss, err := liveSessions()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]string{}
+	for _, s := range ss {
+		got[s.SID] = s.State
+	}
+	want := map[string]string{"esc": "idle", "busy": "working", "unknown": "working"}
+	if len(got) != len(want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	for sid, st := range want {
+		if got[sid] != st {
+			t.Errorf("%s: got %s, want %s", sid, got[sid], st)
+		}
 	}
 }

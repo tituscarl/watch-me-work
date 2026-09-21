@@ -70,16 +70,116 @@ func runHook() {
 	}
 	e.Text = oneLine(e.Text, 200)
 	appendEvent(e)
+	// finishing while you're already looking at it doesn't count as unread
+	if (in.Event == "Stop" || in.Event == "StopFailure") && focused(e) {
+		appendEvent(Event{TS: e.TS, Ev: "Seen", SID: e.SID})
+	}
+	if !tuiOpen() {
+		return
+	}
 
 	repo := filepath.Base(in.CWD)
+	c := loadConfig()
 	switch in.Event {
 	case "Stop":
-		notify(repo+" is idle", oneLine(in.LastMsg, 120), false)
+		notify(repo+" is idle", oneLine(in.LastMsg, 120), c.Sound, c.Idle)
 	case "StopFailure":
-		notify(repo+" failed", e.Text, true)
+		notify(repo+" failed", e.Text, c.Sound, "both")
 	case "PreToolUse", "Notification":
-		notify(repo+" needs you", e.Text, true)
+		notify(repo+" needs you", e.Text, c.Sound, "both")
 	}
+}
+
+// User settings, written by `wmw config`. Only read when about to notify.
+type config struct {
+	Idle  string `json:"idle"`  // both, banner, sound
+	Sound string `json:"sound"` // system sound name or a path to an audio file
+}
+
+var notifyStyles = []string{"both", "banner", "sound"}
+
+const soundDir = "/System/Library/Sounds"
+
+// soundPath accepts a bare system sound name like Glass or a path to any file afplay can play.
+func soundPath(s string) string {
+	if strings.Contains(s, "/") {
+		return s
+	}
+	return filepath.Join(soundDir, s+".aiff")
+}
+
+func systemSounds() []string {
+	paths, _ := filepath.Glob(filepath.Join(soundDir, "*.aiff"))
+	var names []string
+	for _, p := range paths {
+		names = append(names, strings.TrimSuffix(filepath.Base(p), ".aiff"))
+	}
+	return names
+}
+
+func playSound(s string) {
+	// Start, not Run: afplay blocks for the length of the clip and Claude
+	// waits for the hook to exit. Its output goes to /dev/null by default,
+	// so it doesn't hold the hook's stdout open either.
+	exec.Command("afplay", soundPath(s)).Start()
+}
+
+func configPath() string {
+	dir := os.Getenv("XDG_CONFIG_HOME")
+	if dir == "" {
+		home, _ := os.UserHomeDir()
+		dir = filepath.Join(home, ".config")
+	}
+	return filepath.Join(dir, "wmw", "config.json")
+}
+
+func loadConfig() config {
+	c := config{Idle: "both"}
+	if b, err := os.ReadFile(configPath()); err == nil {
+		json.Unmarshal(b, &c)
+		// briefly there were two sounds; keep the idle one if that's what is on disk
+		var old struct {
+			IdleSound string `json:"idleSound"`
+		}
+		if json.Unmarshal(b, &old); c.Sound == "" {
+			c.Sound = old.IdleSound
+		}
+	}
+	if c.Sound == "" { // default applied last so the legacy check above sees an empty value
+		c.Sound = "Glass"
+	}
+	return c
+}
+
+func saveConfig(c config) error {
+	os.MkdirAll(filepath.Dir(configPath()), 0o700)
+	b, _ := json.MarshalIndent(c, "", "  ")
+	return os.WriteFile(configPath(), append(b, '\n'), 0o600)
+}
+
+// focused reports whether the session's terminal is the one in front right now.
+// VS Code can't be asked which terminal tab is showing, so it's never focused here.
+func focused(e Event) bool {
+	if e.Pane != "" {
+		out, err := exec.Command("tmux", "display", "-p", "-t", e.Pane, "#{pane_active} #{window_active} #{session_attached}").Output()
+		f := strings.Fields(string(out))
+		if err != nil || len(f) != 3 || f[0] != "1" || f[1] != "1" || f[2] == "0" {
+			return false
+		}
+		if e.ITerm == "" {
+			return true
+		}
+		// tmux inside iTerm2: the pane is active, now the tab must be in front too
+	}
+	if e.ITerm == "" {
+		return false
+	}
+	out, err := exec.Command("osascript",
+		"-e", `tell application "iTerm2"`,
+		"-e", `if not frontmost then return ""`,
+		"-e", `return id of current session of current window`,
+		"-e", `end tell`).Output()
+	return err == nil && strings.TrimSpace(string(out)) == e.ITerm
 }
 
 func appendEvent(e Event) {
@@ -109,19 +209,21 @@ func oneLine(s string, n int) string {
 	return string([]rune(s)[:n-1]) + "…"
 }
 
-func notify(title, body string, urgent bool) {
-	switch runtime.GOOS {
-	case "darwin":
-		sound := "Glass"
-		if urgent {
-			sound = "Basso"
-		}
-		// text goes in via argv so nothing needs escaping inside the script
-		exec.Command("osascript",
-			"-e", "on run argv",
-			"-e", "display notification (item 2 of argv) with title (item 1 of argv) sound name (item 3 of argv)",
-			"-e", "end run", title, body, sound).Run()
-	default:
+// notify shows a banner, plays a sound, or both. The sound goes through afplay
+// rather than the banner's "sound name": that one only plays if Notification
+// Center's per-app sound toggle happens to be on. Linux gets a banner only.
+func notify(title, body, sound, style string) {
+	if runtime.GOOS != "darwin" {
 		exec.Command("notify-send", title, body).Run()
+		return
+	}
+	if style != "banner" {
+		playSound(sound)
+	}
+	if style != "sound" {
+		// text goes in via argv so nothing needs escaping inside the script
+		exec.Command("osascript", "-e", "on run argv",
+			"-e", "display notification (item 2 of argv) with title (item 1 of argv)",
+			"-e", "end run", title, body).Run()
 	}
 }

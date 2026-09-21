@@ -7,7 +7,10 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
+	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -31,6 +34,7 @@ type Session struct {
 	State                       string // working, idle, blocked, failed
 	Prompt                      string // last thing the user asked
 	Note                        string // what it is blocked or failed on
+	Unread                      bool   // finished or failed and not opened from the TUI since
 	Updated                     int64
 }
 
@@ -39,13 +43,33 @@ func (s Session) Project() string { return filepath.Base(s.CWD) }
 // Sessions killed without a SessionEnd fall off after this long.
 const stale = 6 * time.Hour
 
-func eventsPath() string {
+func statePath(name string) string {
 	dir := os.Getenv("XDG_STATE_HOME")
 	if dir == "" {
 		home, _ := os.UserHomeDir()
 		dir = filepath.Join(home, ".local", "state")
 	}
-	return filepath.Join(dir, "wmw", "events.jsonl")
+	return filepath.Join(dir, "wmw", name)
+}
+
+func eventsPath() string { return statePath("events.jsonl") }
+
+// The TUI leaves its pid here while running; notifications only fire while
+// something is around to look at. A stale file from a crash fails the liveness
+// check, so it needs no cleanup.
+func tuiPidPath() string { return statePath("tui.pid") }
+
+func tuiOpen() bool {
+	b, err := os.ReadFile(tuiPidPath())
+	if err != nil {
+		return false
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(b)))
+	if err != nil || pid <= 0 {
+		return false
+	}
+	p, err := os.FindProcess(pid)
+	return err == nil && p.Signal(syscall.Signal(0)) == nil
 }
 
 func readEvents() ([]Event, error) {
@@ -100,12 +124,18 @@ func fold(evs []Event, now int64) []Session {
 		if e.Path != "" {
 			s.Path = e.Path
 		}
-		s.Updated = e.TS
+		if e.Ev != "Seen" { // looking at a session isn't activity in it
+			s.Updated = e.TS
+		}
 		switch e.Ev {
-		case "SessionStart", "Stop":
-			s.State, s.Note = "idle", ""
+		case "SessionStart":
+			s.State, s.Note, s.Unread = "idle", "", false
+		case "Stop":
+			s.State, s.Note, s.Unread = "idle", "", true
+		case "Seen": // written by the TUI when you open the session
+			s.Unread = false
 		case "UserPromptSubmit":
-			s.State, s.Prompt, s.Note = "working", e.Text, ""
+			s.State, s.Prompt, s.Note, s.Unread = "working", e.Text, "", false
 		case "PreToolUse", "Notification":
 			s.State, s.Note = "blocked", e.Text
 		case "PostToolUse":
@@ -114,7 +144,7 @@ func fold(evs []Event, now int64) []Session {
 				s.State, s.Note = "working", ""
 			}
 		case "StopFailure":
-			s.State, s.Note = "failed", e.Text
+			s.State, s.Note, s.Unread = "failed", e.Text, true
 		}
 	}
 	var out []Session
@@ -141,10 +171,52 @@ func liveSessions() ([]Session, error) {
 		return nil, err
 	}
 	ss := fold(evs, time.Now().Unix())
-	for i := range ss {
-		ss[i].Title = title(ss[i])
+	reg := registry()
+	out := ss[:0]
+	for _, s := range ss {
+		r, known := reg[s.SID]
+		if known && !r.alive {
+			continue // terminal was killed, no SessionEnd ever came
+		}
+		// Esc fires no hook, so an interrupted turn would sit on "working" forever.
+		// Claude's own status flips to idle at that moment, so trust it when it is newer.
+		if known && s.State == "working" && r.Status == "idle" && r.StatusAt/1000 >= s.Updated {
+			s.State = "idle"
+		}
+		s.Title = title(s)
+		out = append(out, s)
 	}
-	return ss, nil
+	return out, nil
+}
+
+// Claude Code keeps one file per running session under ~/.claude/sessions.
+// ponytail: undocumented, so anything odd about a file just means we ignore it
+// and fall back to the hooks.
+type registryEntry struct {
+	SID      string `json:"sessionId"`
+	PID      int    `json:"pid"`
+	Status   string `json:"status"`          // busy, idle
+	StatusAt int64  `json:"statusUpdatedAt"` // ms
+	alive    bool
+}
+
+func registry() map[string]registryEntry {
+	home, _ := os.UserHomeDir()
+	files, _ := filepath.Glob(filepath.Join(home, ".claude", "sessions", "*.json"))
+	out := map[string]registryEntry{}
+	for _, f := range files {
+		var r registryEntry
+		if b, err := os.ReadFile(f); err != nil || json.Unmarshal(b, &r) != nil || r.SID == "" {
+			continue
+		}
+		p, err := os.FindProcess(r.PID)
+		r.alive = err == nil && p.Signal(syscall.Signal(0)) == nil
+		// a resumed session leaves a file per pid; the live one, then the newest, wins
+		if prev, ok := out[r.SID]; !ok || (r.alive && !prev.alive) || (r.alive == prev.alive && r.StatusAt > prev.StatusAt) {
+			out[r.SID] = r
+		}
+	}
+	return out
 }
 
 // Claude rewrites an ai-title record in the transcript every turn, and /rename

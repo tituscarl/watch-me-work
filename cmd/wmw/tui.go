@@ -4,6 +4,9 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"slices"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -22,10 +25,13 @@ var (
 		"working": lipgloss.NewStyle().Foreground(lipgloss.Color("3")),
 		"idle":    lipgloss.NewStyle().Foreground(lipgloss.Color("2")),
 	}
-	dim   = lipgloss.NewStyle().Faint(true)
-	bold  = lipgloss.NewStyle().Bold(true)
-	plain = lipgloss.NewStyle()
-	barBg = lipgloss.AdaptiveColor{Light: "254", Dark: "237"} // selected row
+	dim    = lipgloss.NewStyle().Faint(true)
+	bold   = lipgloss.NewStyle().Bold(true)
+	plain  = lipgloss.NewStyle()
+	unread = lipgloss.NewStyle().Foreground(lipgloss.Color("12")).Bold(true)
+	barBg  = lipgloss.AdaptiveColor{Light: "254", Dark: "237"} // selected row
+	// frames a working dot grows through, smallest first
+	pulse = []string{"·", "•", "●"}
 )
 
 type (
@@ -42,6 +48,41 @@ type model struct {
 	hx, hy   int // mouse position, hy is -1 when unknown
 	width    int
 	msg      string
+	cfg      config
+	lastLoad time.Time // reload is slower than the redraw, see Update
+}
+
+// settingsRow is the screen line of the idle-notification setting, kept in one
+// place so View draws it where Update expects clicks.
+func (m model) settingsRow() int {
+	if n := len(m.rows()); n > 0 {
+		return n + 3 // header, rows, blank, cwd
+	}
+	return 2 // "no live sessions", blank
+}
+
+func (m *model) cycleIdle() {
+	i := slices.Index(notifyStyles, m.cfg.Idle)
+	m.cfg.Idle = notifyStyles[(i+1)%len(notifyStyles)]
+	m.save()
+}
+
+// cycleSound steps through the system sounds and previews the new one.
+// A custom file path in the config restarts from the first system sound.
+func (m *model) cycleSound() {
+	names := systemSounds()
+	if len(names) == 0 {
+		return
+	}
+	m.cfg.Sound = names[(slices.Index(names, m.cfg.Sound)+1)%len(names)]
+	playSound(m.cfg.Sound)
+	m.save()
+}
+
+func (m *model) save() {
+	if err := saveConfig(m.cfg); err != nil {
+		m.msg = "could not save config: " + err.Error()
+	}
 }
 
 // row is one visible line: a lone session, a project header, or a child under one.
@@ -51,6 +92,7 @@ type row struct {
 	s       Session // the session, or the most urgent one for a header
 	n       int     // sessions in the group, >1 marks a header
 	child   bool
+	unread  bool // the session, or any session in the group
 }
 
 // rows groups sessions by project, keeping the urgency order fold gave us.
@@ -68,13 +110,17 @@ func (m model) rows() []row {
 	for _, p := range order {
 		ss := groups[p]
 		if len(ss) == 1 {
-			out = append(out, row{key: ss[0].SID, project: p, s: ss[0]})
+			out = append(out, row{key: ss[0].SID, project: p, s: ss[0], unread: ss[0].Unread})
 			continue
 		}
-		out = append(out, row{key: "grp:" + p, project: p, s: ss[0], n: len(ss)})
+		hdr := row{key: "grp:" + p, project: p, s: ss[0], n: len(ss)}
+		for _, s := range ss {
+			hdr.unread = hdr.unread || s.Unread
+		}
+		out = append(out, hdr)
 		if m.open[p] {
 			for _, s := range ss {
-				out = append(out, row{key: s.SID, project: p, s: s, child: true})
+				out = append(out, row{key: s.SID, project: p, s: s, child: true, unread: s.Unread})
 			}
 		}
 	}
@@ -82,7 +128,12 @@ func (m model) rows() []row {
 }
 
 func runTUI() error {
-	_, err := tea.NewProgram(model{width: 80, hy: -1, open: map[string]bool{}}, tea.WithAltScreen(), tea.WithMouseAllMotion()).Run()
+	// ponytail: last TUI to start owns the pid file; closing it silences
+	// notifications even if another one is still open
+	os.MkdirAll(filepath.Dir(tuiPidPath()), 0o700)
+	os.WriteFile(tuiPidPath(), []byte(strconv.Itoa(os.Getpid())), 0o600)
+	defer os.Remove(tuiPidPath())
+	_, err := tea.NewProgram(model{width: 80, hy: -1, open: map[string]bool{}, cfg: loadConfig()}, tea.WithAltScreen(), tea.WithMouseAllMotion()).Run()
 	return err
 }
 
@@ -92,7 +143,7 @@ func reload() tea.Msg {
 }
 
 func tick() tea.Cmd {
-	return tea.Tick(500*time.Millisecond, func(t time.Time) tea.Msg { return tickMsg(t) })
+	return tea.Tick(100*time.Millisecond, func(t time.Time) tea.Msg { return tickMsg(t) })
 }
 
 func (m model) Init() tea.Cmd { return tea.Batch(reload, tick()) }
@@ -102,7 +153,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 	case tickMsg:
-		return m, tea.Batch(reload, tick())
+		// the animation wants a 100ms redraw, the session list does not; reading
+		// the log and stat-ing every pid that often is pure waste
+		if t := time.Time(msg); t.Sub(m.lastLoad) >= 500*time.Millisecond {
+			m.lastLoad = t
+			return m, tea.Batch(reload, tick())
+		}
+		return m, tick()
 	case sessionsMsg:
 		m.sessions = msg
 		m.cursor = 0
@@ -115,6 +172,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.msg = string(msg)
 	case tea.MouseMsg:
 		m.hx, m.hy = msg.X, msg.Y
+		if msg.Action == tea.MouseActionPress && msg.Button == tea.MouseButtonLeft && msg.Y == m.settingsRow() {
+			m.cycleIdle()
+			return m, nil
+		}
 		// header is row 0, sessions start at row 1
 		if r := msg.Y - 1; msg.Action == tea.MouseActionPress && msg.Button == tea.MouseButtonLeft && r >= 0 && r < len(m.rows()) {
 			m.cursor = r
@@ -135,6 +196,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		case "enter", " ":
 			return m.activate()
+		case "n":
+			m.cycleIdle()
+		case "s":
+			m.cycleSound()
 		}
 	}
 	if rs := m.rows(); m.cursor < len(rs) {
@@ -156,7 +221,9 @@ func (m model) activate() (tea.Model, tea.Cmd) {
 		m.open[r.project] = !m.open[r.project]
 		return m, nil
 	}
-	return m, func() tea.Msg { return jumpMsg(jump(r.s)) }
+	// opening counts as having seen it, whether or not the jump lands
+	appendEvent(Event{TS: time.Now().Unix(), Ev: "Seen", SID: r.s.SID})
+	return m, tea.Batch(reload, func() tea.Msg { return jumpMsg(jump(r.s)) })
 }
 
 func (m model) View() string {
@@ -165,9 +232,8 @@ func (m model) View() string {
 	if len(rs) == 0 {
 		b.WriteString(dim.Render("no live sessions") + "\n")
 	} else {
-		now := time.Now().Unix()
-		tw := max(20, m.width-projW-20) // mark, spaces, STATE and AGE add up to 20
-		b.WriteString(dim.Render(fmt.Sprintf("  %-*s %-*s %-8s %5s", projW, "PROJECT", tw, "TITLE", "STATE", "AGE")) + "\n")
+		tw := max(20, m.width-projW-7) // mark, gaps, state dot, unread dot
+		b.WriteString(dim.Render(fmt.Sprintf("  %-*s     %-*s", projW, "PROJECT", tw, "TITLE")) + "\n")
 		for i, r := range rs {
 			sel := i == m.cursor
 			// every segment gets the bar background on the selected row; styling the
@@ -196,16 +262,26 @@ func (m model) View() string {
 				mark, nameStyle = "❯ ", bold
 			}
 			line := paint(plain, mark) + paint(nameStyle, name) + paint(plain, " ")
+			// unread dot sits after the state dot; a header carries it for any child
+			flag := " "
+			if r.unread {
+				flag = "•"
+			}
 			if r.n > 1 {
 				// group headers show only the name; hovering the count explains it
+				line += paint(plain, " ") + paint(unread, " "+flag)
 				if m.hy == i+1 && overCount(r, m.hx) {
-					line += paint(dim, oneLine(m.countHint(r), tw))
+					line += paint(dim, " "+oneLine(m.countHint(r), tw))
 				}
 			} else {
-				// pad before styling, ANSI codes would throw off %-8s
-				line += paint(plain, fmt.Sprintf("%-*s ", tw, oneLine(r.s.Title, tw))) +
-					paint(stateStyle[r.s.State], fmt.Sprintf("%-8s", r.s.State)) +
-					paint(plain, fmt.Sprintf(" %5s", age(now-r.s.Updated)))
+				// state is a colored dot: red blocked, magenta failed, yellow working, green idle.
+				// Working grows the dot a step every 200ms, then starts over small.
+				dot := "●"
+				if r.s.State == "working" {
+					dot = pulse[time.Now().UnixMilli()/200%int64(len(pulse))]
+				}
+				line += paint(stateStyle[r.s.State], dot) + paint(unread, " "+flag) +
+					paint(plain, fmt.Sprintf(" %-*s", tw, oneLine(r.s.Title, tw)))
 			}
 			if sel {
 				line += paint(plain, strings.Repeat(" ", max(0, m.width-lipgloss.Width(line))))
@@ -216,8 +292,13 @@ func (m model) View() string {
 			b.WriteString("\n" + dim.Render(rs[m.cursor].s.CWD) + "\n")
 		}
 	}
-	if m.msg != "" { // only jump failures end up here
-		b.WriteString("\n" + m.msg)
+	// keep in step with settingsRow: this must land on that line
+	if len(rs) == 0 {
+		b.WriteString("\n")
+	}
+	b.WriteString(dim.Render("idle: ") + m.cfg.Idle + dim.Render(" · sound: ") + m.cfg.Sound + dim.Render("   n / s to change") + "\n")
+	if m.msg != "" { // only failures end up here
+		b.WriteString(m.msg)
 	}
 	return b.String()
 }
