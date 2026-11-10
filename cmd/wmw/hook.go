@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -52,6 +53,8 @@ func runHook() {
 		e.Pane, e.ITerm = os.Getenv("TMUX_PANE"), iterm // tmux inside iTerm2 wants both
 	case "iTerm.app":
 		e.ITerm = iterm
+	case "ghostty":
+		e.Ghostty = ttyOf(os.Getppid())
 	case "vscode":
 		e.Term = "vscode"
 	}
@@ -171,6 +174,14 @@ func focused(e Event) bool {
 		}
 		// tmux inside iTerm2: the pane is active, now the tab must be in front too
 	}
+	if e.Ghostty != "" {
+		out, err := exec.Command("osascript",
+			"-e", `tell application "Ghostty"`,
+			"-e", `if not frontmost then return ""`,
+			"-e", `return tty of focused terminal of selected tab of front window`,
+			"-e", `end tell`).Output()
+		return err == nil && strings.TrimSpace(string(out)) == e.Ghostty
+	}
 	if e.ITerm == "" {
 		return false
 	}
@@ -180,6 +191,27 @@ func focused(e Event) bool {
 		"-e", `return id of current session of current window`,
 		"-e", `end tell`).Output()
 	return err == nil && strings.TrimSpace(string(out)) == e.ITerm
+}
+
+// ttyOf returns the controlling terminal of pid or its nearest ancestor that
+// has one. Hooks run detached, but the agent that spawned them still owns the tty.
+// ponytail: ttys get reused. The jump looks the tty up again from the live
+// pid, so a stale one only matters when Claude's registry has no pid for it.
+func ttyOf(pid int) string {
+	for range 5 {
+		out, err := exec.Command("ps", "-o", "tty=,ppid=", "-p", strconv.Itoa(pid)).Output()
+		f := strings.Fields(string(out))
+		if err != nil || len(f) != 2 {
+			return ""
+		}
+		if strings.Trim(f[0], "?") != "" {
+			return "/dev/" + f[0]
+		}
+		if pid, _ = strconv.Atoi(f[1]); pid <= 1 {
+			return ""
+		}
+	}
+	return ""
 }
 
 func appendEvent(e Event) {

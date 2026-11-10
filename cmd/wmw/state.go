@@ -22,20 +22,24 @@ type Event struct {
 	CWD   string `json:"cwd,omitempty"`
 	Pane  string `json:"pane,omitempty"`  // tmux
 	ITerm string `json:"iterm,omitempty"` // iTerm2 session uuid
-	Term  string `json:"term,omitempty"`  // "vscode" when in its integrated terminal
-	Path  string `json:"tp,omitempty"`    // transcript path
-	Text  string `json:"text,omitempty"`
+	// Ghostty's AppleScript ids don't match GHOSTTY_SURFACE_ID, so the tty is
+	// what ties a session to its terminal there.
+	Ghostty string `json:"ghostty,omitempty"`
+	Term    string `json:"term,omitempty"` // "vscode" when in its integrated terminal
+	Path    string `json:"tp,omitempty"`   // transcript path
+	Text    string `json:"text,omitempty"`
 }
 
 type Session struct {
-	SID, CWD, Pane, ITerm, Term string
-	Path                        string // transcript, where Claude keeps the title
-	Title                       string
-	State                       string // working, idle, blocked, failed
-	Prompt                      string // last thing the user asked
-	Note                        string // what it is blocked or failed on
-	Unread                      bool   // finished or failed and not opened from the TUI since
-	Updated                     int64
+	SID, CWD, Pane, ITerm, Ghostty, Term string
+	PID                                  int    // agent process from Claude's registry, 0 when unknown
+	Path                                 string // transcript, where Claude keeps the title
+	Title                                string
+	State                                string // working, idle, blocked, failed
+	Prompt                               string // last thing the user asked
+	Note                                 string // what it is blocked or failed on
+	Unread                               bool   // finished or failed and not opened from the TUI since
+	Updated                              int64
 }
 
 func (s Session) Project() string { return filepath.Base(s.CWD) }
@@ -118,6 +122,9 @@ func fold(evs []Event, now int64) []Session {
 		if e.ITerm != "" {
 			s.ITerm = e.ITerm
 		}
+		if e.Ghostty != "" {
+			s.Ghostty = e.Ghostty
+		}
 		if e.Term != "" {
 			s.Term = e.Term
 		}
@@ -182,6 +189,9 @@ func liveSessions() ([]Session, error) {
 		// Claude's own status flips to idle at that moment, so trust it when it is newer.
 		if known && s.State == "working" && r.Status == "idle" && r.StatusAt/1000 >= s.Updated {
 			s.State = "idle"
+		}
+		if known {
+			s.PID = r.PID
 		}
 		s.Title = title(s)
 		out = append(out, s)
