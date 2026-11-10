@@ -17,7 +17,7 @@ import (
 )
 
 // projW is the PROJECT column width; the title takes what the fixed columns leave.
-const projW = 24
+const projW = 32
 
 var (
 	stateStyle = map[string]lipgloss.Style{
@@ -272,9 +272,9 @@ func (m model) View() string {
 			name := r.project
 			switch {
 			case r.child:
-				name = "  ├─▸"
+				name = "  ├─"
 				if i+1 >= len(rs) || !rs[i+1].child {
-					name = "  └─▸"
+					name = "  └─"
 				}
 			case r.n > 1 && m.open[r.project]:
 				name = fmt.Sprintf("▾ %s (%d)", r.project, r.n)
@@ -284,7 +284,7 @@ func (m model) View() string {
 			name = fmt.Sprintf("%-*s", projW, oneLine(name, projW))
 			mark, nameStyle := "  ", plain
 			if sel {
-				mark, nameStyle = "❯ ", bold
+				mark, nameStyle = "▌ ", bold
 			}
 			line := paint(plain, mark) + paint(nameStyle, name) + paint(plain, " ")
 			// unread dot sits after the state dot; a header carries it for any child
@@ -318,6 +318,13 @@ func (m model) View() string {
 		b.WriteString("\n")
 	}
 	b.WriteString(dim.Render("idle: ") + m.cfg.Idle + dim.Render(" · sound: ") + m.cfg.Sound + dim.Render("   n / s to change   "+version()) + "\n")
+	// below the settings line so it doesn't shift any clickable row
+	var legend []string
+	for _, st := range []string{"working", "blocked", "failed", "idle"} {
+		g, gs := stateGlyph(st)
+		legend = append(legend, gs.Render(g)+dim.Render(" "+st))
+	}
+	b.WriteString(strings.Join(legend, dim.Render(" · ")) + dim.Render(" · ") + unread.Render("•") + dim.Render(" unread") + "\n")
 	if m.msg != "" { // only failures end up here
 		b.WriteString(m.msg)
 	}
