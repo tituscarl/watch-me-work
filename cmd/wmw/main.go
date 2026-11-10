@@ -36,8 +36,10 @@ func main() {
 		err = runWait(os.Args[2:])
 	case "config":
 		err = runConfig(os.Args[2:])
+	case "version", "--version", "-v":
+		fmt.Println(version())
 	default:
-		fmt.Fprintln(os.Stderr, "usage: wmw [ls | status | wait <project> [state...] | config ... | install]  (no args opens the TUI)")
+		fmt.Fprintln(os.Stderr, "usage: wmw [ls | status | wait <project> [state...] | config ... | install | version]  (no args opens the TUI)")
 		os.Exit(2)
 	}
 	if err != nil {

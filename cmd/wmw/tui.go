@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime/debug"
 	"slices"
 	"strconv"
 	"strings"
@@ -65,6 +66,15 @@ type model struct {
 	msg      string
 	cfg      config
 	lastLoad time.Time // reload is slower than the redraw, see Update
+}
+
+// version is the module version go install stamped in, "(devel)" for a plain go build
+// outside a tagged checkout.
+func version() string {
+	if bi, ok := debug.ReadBuildInfo(); ok {
+		return bi.Main.Version
+	}
+	return "unknown"
 }
 
 // settingsRow is the screen line of the idle-notification setting, kept in one
@@ -307,7 +317,7 @@ func (m model) View() string {
 	if len(rs) == 0 {
 		b.WriteString("\n")
 	}
-	b.WriteString(dim.Render("idle: ") + m.cfg.Idle + dim.Render(" · sound: ") + m.cfg.Sound + dim.Render("   n / s to change") + "\n")
+	b.WriteString(dim.Render("idle: ") + m.cfg.Idle + dim.Render(" · sound: ") + m.cfg.Sound + dim.Render("   n / s to change   "+version()) + "\n")
 	if m.msg != "" { // only failures end up here
 		b.WriteString(m.msg)
 	}
