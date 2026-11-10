@@ -1,0 +1,17 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    # wmw is macOS only, so test where it actually runs
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go vet ./...
+      - run: go test ./...
