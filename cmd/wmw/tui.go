@@ -20,19 +20,34 @@ const projW = 24
 
 var (
 	stateStyle = map[string]lipgloss.Style{
-		"blocked": lipgloss.NewStyle().Foreground(lipgloss.Color("1")).Bold(true),
-		"failed":  lipgloss.NewStyle().Foreground(lipgloss.Color("5")).Bold(true),
-		"working": lipgloss.NewStyle().Foreground(lipgloss.Color("3")),
-		"idle":    lipgloss.NewStyle().Foreground(lipgloss.Color("2")),
+		"blocked": lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "160", Dark: "203"}).Bold(true),
+		"failed":  lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "127", Dark: "170"}).Bold(true),
+		"working": lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "136", Dark: "220"}), // yellow, kept clear of Claude's orange ✳
+		"idle":    lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "28", Dark: "78"}),
 	}
 	dim    = lipgloss.NewStyle().Faint(true)
 	bold   = lipgloss.NewStyle().Bold(true)
 	plain  = lipgloss.NewStyle()
-	unread = lipgloss.NewStyle().Foreground(lipgloss.Color("12")).Bold(true)
+	unread = lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "26", Dark: "75"}).Bold(true)
 	barBg  = lipgloss.AdaptiveColor{Light: "254", Dark: "237"} // selected row
-	// frames a working dot grows through, smallest first
-	pulse = []string{"·", "•", "●"}
+	// braille spinner for working, one frame per 100ms redraw
+	spinner = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 )
+
+// stateGlyph gives each state its own shape as well as its color, so blocked
+// and idle stay apart for anyone who can't tell red from green.
+func stateGlyph(state string) (string, lipgloss.Style) {
+	g := "●"
+	switch state {
+	case "blocked":
+		g = "▲"
+	case "failed":
+		g = "✖"
+	case "working":
+		g = spinner[time.Now().UnixMilli()/100%int64(len(spinner))]
+	}
+	return g, stateStyle[state]
+}
 
 type (
 	tickMsg     time.Time
@@ -267,20 +282,16 @@ func (m model) View() string {
 			if r.unread {
 				flag = "•"
 			}
+			dot, dotStyle := stateGlyph(r.s.State)
 			if r.n > 1 {
-				// group headers show only the name; hovering the count explains it
-				line += paint(plain, " ") + paint(unread, " "+flag)
+				// a header shows its most urgent child's state, so a collapsed group
+				// can't hide a blocked session; hovering the count explains the rest
+				line += paint(dotStyle, dot) + paint(unread, " "+flag)
 				if m.hy == i+1 && overCount(r, m.hx) {
 					line += paint(dim, " "+oneLine(m.countHint(r), tw))
 				}
 			} else {
-				// state is a colored dot: red blocked, magenta failed, yellow working, green idle.
-				// Working grows the dot a step every 200ms, then starts over small.
-				dot := "●"
-				if r.s.State == "working" {
-					dot = pulse[time.Now().UnixMilli()/200%int64(len(pulse))]
-				}
-				line += paint(stateStyle[r.s.State], dot) + paint(unread, " "+flag) +
+				line += paint(dotStyle, dot) + paint(unread, " "+flag) +
 					paint(plain, fmt.Sprintf(" %-*s", tw, oneLine(r.s.Title, tw)))
 			}
 			if sel {
@@ -328,11 +339,20 @@ func (m model) countHint(r row) string {
 }
 
 // jump brings the terminal the session runs in to the front. tmux first so the
-// right pane is selected, then iTerm2 or VS Code so the right window is on top.
+// right pane is selected, then iTerm2, Ghostty or VS Code so the right window is on top.
 // Returns "" on success, otherwise what went wrong.
 func jump(s Session) string {
-	if s.Pane == "" && s.ITerm == "" && s.Term == "" {
-		return s.Project() + " was not started in tmux, iTerm2, or VS Code"
+	// The live pid gives the tty as it is now. That beats one a hook saw hours
+	// ago, and covers sessions that had no event since wmw learned about Ghostty.
+	// The TERM_PROGRAM check keeps a jump from launching Ghostty for iTerm2 users.
+	if s.PID != 0 && s.Pane == "" && s.ITerm == "" && s.Term == "" &&
+		(s.Ghostty != "" || os.Getenv("TERM_PROGRAM") == "ghostty") {
+		if t := ttyOf(s.PID); t != "" {
+			s.Ghostty = t
+		}
+	}
+	if s.Pane == "" && s.ITerm == "" && s.Ghostty == "" && s.Term == "" {
+		return s.Project() + " was not started in tmux, iTerm2, Ghostty, or VS Code"
 	}
 	var problems []string
 	if s.Pane != "" && os.Getenv("TMUX") != "" {
@@ -347,6 +367,13 @@ func jump(s Session) string {
 		cmd.Stdin = strings.NewReader(iTermFocus)
 		if res, err := cmd.Output(); err != nil || strings.TrimSpace(string(res)) != "ok" {
 			problems = append(problems, "iTerm2 session gone")
+		}
+	}
+	if s.Ghostty != "" {
+		cmd := exec.Command("osascript", "-", s.Ghostty)
+		cmd.Stdin = strings.NewReader(ghosttyFocus)
+		if res, err := cmd.Output(); err != nil || strings.TrimSpace(string(res)) != "ok" {
+			problems = append(problems, "Ghostty terminal gone")
 		}
 	}
 	if s.Term == "vscode" {
@@ -365,6 +392,20 @@ func jump(s Session) string {
 	}
 	return s.Project() + ": " + strings.Join(problems, ", ")
 }
+
+const ghosttyFocus = `on run argv
+  tell application "Ghostty"
+    repeat with t in terminals
+      if tty of t is item 1 of argv then
+        focus t
+        activate
+        return "ok"
+      end if
+    end repeat
+  end tell
+  return "gone"
+end run
+`
 
 const iTermFocus = `on run argv
   tell application "iTerm2"

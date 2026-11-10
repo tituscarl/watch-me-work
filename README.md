@@ -24,4 +24,5 @@ Then run `wmw` to open the dashboard. `wmw ls`, `wmw status`, and `wmw wait <pro
 Sessions are tracked in any terminal. Jumping to a session from the TUI works in:
 
 - iTerm2
+- Ghostty (a version with AppleScript support, enabled by default on macOS)
 - VS Code integrated terminal
