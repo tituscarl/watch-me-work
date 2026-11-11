@@ -57,15 +57,16 @@ type (
 )
 
 type model struct {
-	sessions []Session
-	open     map[string]bool // expanded project groups
-	sel      string          // key of the row under the cursor; rows move as states change
-	cursor   int
-	hx, hy   int // mouse position, hy is -1 when unknown
-	width    int
-	msg      string
-	cfg      config
-	lastLoad time.Time // reload is slower than the redraw, see Update
+	sessions  []Session
+	open      map[string]bool // expanded project groups
+	sel       string          // key of the row under the cursor; rows move as states change
+	cursor    int
+	hx, hy    int // mouse position, hy is -1 when unknown
+	width     int
+	msg       string
+	cfg       config
+	lastLoad  time.Time // reload is slower than the redraw, see Update
+	lastFocus time.Time
 }
 
 // version is the module version go install stamped in, "(devel)" for a plain go build
@@ -167,6 +168,21 @@ func reload() tea.Msg {
 	return sessionsMsg(ss)
 }
 
+// seenIfFocused clears the dot on a session you switched to yourself. The hook
+// only catches the case where you were already on it when it stopped.
+// ponytail: one osascript per unread session every 2s. If that gets heavy, ask
+// the terminal for its front session once and compare against all of them.
+func seenIfFocused(ss []Session) tea.Cmd {
+	return func() tea.Msg {
+		for _, s := range ss {
+			if s.Unread && focused(Event{Pane: s.Pane, ITerm: s.ITerm, Ghostty: s.Ghostty}) {
+				appendEvent(Event{TS: time.Now().Unix(), Ev: "Seen", SID: s.SID})
+			}
+		}
+		return nil
+	}
+}
+
 func tick() tea.Cmd {
 	return tea.Tick(100*time.Millisecond, func(t time.Time) tea.Msg { return tickMsg(t) })
 }
@@ -182,6 +198,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// the log and stat-ing every pid that often is pure waste
 		if t := time.Time(msg); t.Sub(m.lastLoad) >= 500*time.Millisecond {
 			m.lastLoad = t
+			if t.Sub(m.lastFocus) >= 2*time.Second {
+				m.lastFocus = t
+				return m, tea.Batch(reload, tick(), seenIfFocused(m.sessions))
+			}
 			return m, tea.Batch(reload, tick())
 		}
 		return m, tick()
