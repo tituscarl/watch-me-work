@@ -278,7 +278,7 @@ func (m model) View() string {
 		b.WriteString(dim.Render("no live sessions") + "\n")
 	} else {
 		tw := max(20, m.width-projW-7) // mark, gaps, state dot, unread dot
-		b.WriteString(dim.Render(fmt.Sprintf("  %-*s     %-*s", projW, "PROJECT", tw, "TITLE")) + "\n")
+		b.WriteString(dim.Render("  SESSIONS") + "\n")
 		for i, r := range rs {
 			sel := i == m.cursor
 			// every segment gets the bar background on the selected row; styling the
@@ -289,30 +289,40 @@ func (m model) View() string {
 				}
 				return st.Render(text)
 			}
+			mark, nameStyle := "  ", plain
+			if sel {
+				mark, nameStyle = "▌ ", bold
+			}
+			flag := " "
+			if r.unread {
+				flag = "•"
+			}
+			dot, dotStyle := stateGlyph(r.s.State)
+			if r.child {
+				// children drop the PROJECT column and hang off the header, so the
+				// branch leads straight into their own dot and title
+				branch := "  ├─ "
+				if i+1 >= len(rs) || !rs[i+1].child {
+					branch = "  └─ "
+				}
+				line := paint(plain, mark) + paint(dim, branch) + paint(dotStyle, dot) + paint(unread, " "+flag) +
+					paint(nameStyle, fmt.Sprintf(" %-*s", projW+tw-4, oneLine(r.s.Title, projW+tw-4)))
+				if sel {
+					line += paint(plain, strings.Repeat(" ", max(0, m.width-lipgloss.Width(line))))
+				}
+				b.WriteString(line + "\n")
+				continue
+			}
 			name := r.project
 			switch {
-			case r.child:
-				name = "  ├─"
-				if i+1 >= len(rs) || !rs[i+1].child {
-					name = "  └─"
-				}
 			case r.n > 1 && m.open[r.project]:
 				name = fmt.Sprintf("▾ %s (%d)", r.project, r.n)
 			case r.n > 1:
 				name = fmt.Sprintf("▸ %s (%d)", r.project, r.n)
 			}
 			name = fmt.Sprintf("%-*s", projW, oneLine(name, projW))
-			mark, nameStyle := "  ", plain
-			if sel {
-				mark, nameStyle = "▌ ", bold
-			}
-			line := paint(plain, mark) + paint(nameStyle, name) + paint(plain, " ")
 			// unread dot sits after the state dot; a header carries it for any child
-			flag := " "
-			if r.unread {
-				flag = "•"
-			}
-			dot, dotStyle := stateGlyph(r.s.State)
+			line := paint(plain, mark) + paint(nameStyle, name) + paint(plain, " ")
 			if r.n > 1 {
 				// a header shows its most urgent child's state, so a collapsed group
 				// can't hide a blocked session; hovering the count explains the rest
